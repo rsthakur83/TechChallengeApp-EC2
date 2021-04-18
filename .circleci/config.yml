@@ -1,0 +1,179 @@
+version: 2.1
+orbs:
+  github-release: h-matsuo/github-release@0.1.1
+jobs:
+  terraform_backend:
+    docker:
+      - image: golang:1.15
+    description: Create S3 to store terraform state file  
+    steps:
+      - checkout
+      - run:
+         name: "Terraform S3 backend Bucket"
+         command: |
+           apt-get update; apt-get  -y install unzip zip awscli
+           wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+           unzip terraform_0.12.0_linux_amd64.zip
+           chmod +x terraform
+           mkdir /root/.aws/
+           echo "[default]"  >> /root/.aws/credentials
+           echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+           echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials        
+           cd backend
+           sed -i "s/aws-region/$aws_region/g" variable.tf
+           sed -i "s/terraform_state_bucket/$terraform_state_bucket/g" backend.tf
+           sed -i "s/terraform_state_bucket/$terraform_state_bucket/g" bucket_check.sh
+           sed -i "s/app_artifact_bucket/$app_artifact_bucket/g"       bucket_check.sh
+           sed -i "s/app_artifact_bucket/$app_artifact_bucket/g"       backend.tf
+           chmod +x bucket_check.sh
+           ./bucket_check.sh
+
+  build:
+    docker:
+      - image: golang:1.15
+    description: Build and Store Artifact on S3
+    steps:
+      - run:
+           name: "Git Clone and Build"
+           command: |
+            apt-get update; apt-get  -y install zip awscli
+            mkdir /root/.aws/
+            echo "[default]"  >> /root/.aws/credentials
+            echo "region = ${aws_region}" >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials               
+            git clone ${app_repo}
+            cd TechChallengeApp/;./build.sh
+            export RELEASE_NUMBER="$(cat cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            mkdir artifacts
+            zip -r v${RELEASE_NUMBER}.zip dist
+            cp v${RELEASE_NUMBER}.zip artifacts
+            aws s3 cp artifacts/v${RELEASE_NUMBER}.zip s3://${app_artifact_bucket}/     
+
+  terraform_deploy:
+    docker:
+      - image: 722c/circle-ci-ubuntu-python-3
+    description: Deploying Infra
+    steps:
+      - checkout
+      - run:
+           name: "Deploy Infra"
+           command: |
+            apt-get update; apt-get  -y install zip awscli  dos2unix unzip
+            mkdir /root/.aws/
+            echo "[default]" > /root/.aws/config
+            echo "region = ${aws_region}" >> /root/.aws/config
+            echo "[default]"  >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials
+            wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+            unzip terraform_0.12.0_linux_amd64.zip
+            chmod +x terraform
+            cp terraform /bin
+            cd app
+            sed -i  "s|app_artifact_bucket|$app_artifact_bucket|g" deploy/userdata-asg.sh
+            sed -i  "s|aws-region|$aws_region|g" deploy/userdata-asg.sh
+            sed -i  "s|app-repo|$app_repo|g"  deploy/userdata-asg.sh
+            sed -i  "s|app_artifact_bucket|$app_artifact_bucket|g" deploy/iam_role_policy.tf
+            sed -i  "s|terraform_state_bucket|$terraform_state_bucket|g" deploy/terraform_backend.tf
+            sed -i  "s|aws-region|$aws_region|g" deploy/terraform_backend.tf
+            sed -i  "s|terraform_state_bucket|$terraform_state_bucket|g" lc1/lc.tf
+            sed -i  "s|aws-region|$aws_region|g" lc1/variables.tf
+            sed -i  "s|terraform_state_bucket|$terraform_state_bucket|g" lc2/lc.tf
+            sed -i  "s|aws-region|$aws_region|g"  lc2/variables.tf
+            sed -i  "s|aws-region|$aws_region|g"  deploy.sh
+            sed -i  "s|ami-id|$image_ami_id|g"    deploy.sh
+            sed -i  "s|ami-id|$image_ami_id|g"    lc1/variables.tf
+            sed -i  "s|ami-id|$image_ami_id|g"    lc2/variables.tf
+            chmod +x deploy.sh
+            echo "Execute deploy.sh"
+            sed -i  's/\r$//' deploy.sh
+            echo "Finished deploy.sh"
+            ./deploy.sh
+
+  app_status:
+    docker:
+      - image: golang:1.15
+    steps:
+      - checkout
+      - run: apt-get update && apt-get install -y dos2unix postgresql-client unzip docker.io
+      - run:
+         name: "Application Health Check"
+         command: |
+           apt-get update && apt-get install -y dos2unix postgresql-client unzip docker.io
+           wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+           unzip terraform_0.12.0_linux_amd64.zip
+           chmod +x terraform
+           mkdir /root/.aws/
+           echo "[default]" > /root/.aws/config
+           echo "region = ${aws_region}" >> /root/.aws/config           
+           echo "[default]"  >> /root/.aws/credentials
+           echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+           echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials        
+           cd statebucket; chmod +x check.sh ; chmod +x status.sh
+           sed -i "s|terraform_state_bucket|$terraform_state_bucket|g"  state.tf
+           sed -i "s|aws-region|$aws_region|g" state.tf
+           sed -i "s|aws-region|$aws_region|g" variable.tf
+           ../terraform init
+           sed -i 's/\r$//'  status.sh 
+           sed -i 's/\r$//'  check.sh  
+           ../statebucket/check.sh
+
+  release: 
+    docker:
+      - image: golang:1.15
+    steps:   
+      - checkout
+      - run:
+          name: "Create release after successful deployment"
+          command: |
+            apt-get update; apt-get  -y install zip awscli
+            mkdir /root/.aws/
+            echo "[default]" > /root/.aws/config
+            echo "region = ${aws_region}" >> /root/.aws/config            
+            echo "[default]"  >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials  
+            git clone ${app_repo}
+            cd TechChallengeApp/
+            export RELEASE_NUMBER="$(cat cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            export TAG="$(cat cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            export RELEASE_MESSAGE="$(git log -1 --pretty=%B|head -1)"
+            export COMMIT_MESSAGE="$(git log -1 --pretty=%B)"
+            cd ..
+            mkdir artifacts
+            aws s3 cp  s3://${app_artifact_bucket}/v${RELEASE_NUMBER}.zip artifacts/
+            export BODY="## Release Notes
+            ${COMMIT_MESSAGE}"
+            go get github.com/tcnksm/ghr
+            if [[ $TAG =~ "-" ]]; then
+              echo "It's a PRE-Release!"
+              
+              ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1}  -delete  -n  "v${RELEASE_NUMBER}:${RELEASE_MESSAGE}"  -b "${BODY}" -prerelease v${RELEASE_NUMBER}   ./artifacts
+            else
+              echo "It's a Release!"
+              ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1}  -delete  -n "v${RELEASE_NUMBER}:${RELEASE_MESSAGE}"  -b "${BODY}"  v${RELEASE_NUMBER}  ./artifacts
+            fi
+        
+workflows:
+  version: 2
+  build_deploy_check_release:
+    jobs:
+      - terraform_backend
+      - build:
+         requires:
+           - terraform_backend
+      - terraform_deploy:
+          requires: 
+            - build
+      - app_status:
+          requires:
+           - terraform_deploy         
+      - release:
+         requires:
+            - app_status
+         filters:
+           branches:
+             only: master
+           tags:
+             ignore: /.*/
